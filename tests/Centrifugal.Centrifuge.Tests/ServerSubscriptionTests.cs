@@ -179,6 +179,70 @@ namespace Centrifugal.Centrifuge.Tests
             Assert.Equal("srv", (await ReadAsync(subscribing)).Channel);
         }
 
+        /// <summary>
+        /// A Disconnect() from the StateChanged handler of a reconnect doesn't swallow the
+        /// ServerSubscribing the ended session owes: the next connect's ServerSubscribed follows it.
+        /// </summary>
+        [Fact]
+        public async Task DisconnectFromReconnectHandlerKeepsServerSubscribing()
+        {
+            _server.ConnectResult = new ConnectResult
+            {
+                Client = "fake-client",
+                Version = "0.0.0",
+                Ping = 25,
+                Subs = { ["srv"] = new SubscribeResult { Recoverable = true, Positioned = true, Epoch = "e1", Offset = 7 } }
+            };
+            var events = NewChannel<string>();
+            _client = new CentrifugeClient(_server.Url, new CentrifugeClientOptions());
+            _client.ServerSubscribing += (_, e) => events.Writer.TryWrite("subscribing:" + e.Channel);
+            _client.ServerSubscribed += (_, e) => events.Writer.TryWrite("subscribed:" + e.Channel);
+            _client.Connect();
+            await _client.ReadyAsync();
+            Assert.Equal("subscribing:srv", await ReadAsync(events));
+            Assert.Equal("subscribed:srv", await ReadAsync(events));
+
+            var disconnectOnce = 0;
+            _client.StateChanged += (_, e) =>
+            {
+                if (e.NewState == CentrifugeClientState.Connecting && System.Threading.Interlocked.Exchange(ref disconnectOnce, 1) == 0)
+                    _client.Disconnect();
+            };
+            _server.CloseConnection();
+
+            Assert.Equal("subscribing:srv", await ReadAsync(events));
+            _client.Connect();
+            await _client.ReadyAsync();
+            Assert.Equal("subscribed:srv", await ReadAsync(events));
+        }
+
+        /// <summary>An unsubscribed client-side object of the channel doesn't take the server-side
+        /// subscription's publications nor its unsubscribe.</summary>
+        [Fact]
+        public async Task InactiveClientSubscriptionDoesNotShadowServerSubscription()
+        {
+            _server.ConnectResult = new ConnectResult
+            {
+                Client = "fake-client",
+                Version = "0.0.0",
+                Ping = 25,
+                Subs = { ["srv"] = new SubscribeResult() }
+            };
+            var events = NewChannel<string>();
+            _client = new CentrifugeClient(_server.Url, new CentrifugeClientOptions());
+            _client.Publication += (_, e) => events.Writer.TryWrite("publication:" + e.Channel);
+            _client.ServerUnsubscribed += (_, e) => events.Writer.TryWrite("unsubscribed:" + e.Channel);
+            _client.NewSubscription("srv");
+            _client.Connect();
+            await _client.ReadyAsync();
+
+            await _server.PublishChannelAsync("srv", new byte[] { 1 });
+            await _server.SendPushAsync(new Push { Channel = "srv", Unsubscribe = new Unsubscribe { Code = 2000 } });
+
+            Assert.Equal("publication:srv", await ReadAsync(events));
+            Assert.Equal("unsubscribed:srv", await ReadAsync(events));
+        }
+
         private static Task<T> ReadAsync<T>(System.Threading.Channels.Channel<T> channel) =>
             channel.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10));
 

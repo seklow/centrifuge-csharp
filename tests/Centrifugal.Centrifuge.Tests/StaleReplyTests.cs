@@ -59,7 +59,7 @@ namespace Centrifugal.Centrifuge.Tests
 
             // Real teardown: leaves Connected → generation must be bumped. The client
             // then reconnects and the subscription resubscribes automatically.
-            await _client.HandleNoPingAsync();
+            NoPing.Fire(_client);
             await subscribedEvents.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
 
             Assert.True(_client.ConnectionGeneration > generationBeforeTeardown,
@@ -69,7 +69,7 @@ namespace Centrifugal.Centrifuge.Tests
             // discarded — it must not apply any state (the compaction ID registry
             // gives an observable side effect to assert on).
             var staleResult = new SubscribeResult { Id = 77 };
-            Assert.False(sub.HandleSubscribeReply(staleResult, generationBeforeTeardown),
+            Assert.False(sub.HandleSubscribeReply(staleResult, sub.Epoch, generationBeforeTeardown, attempt: 0),
                 "reply from a torn-down connection must be discarded");
 
             // ID 77 was not registered; ID 42 (registered by the legitimate
@@ -82,7 +82,7 @@ namespace Centrifugal.Centrifuge.Tests
             Assert.False(pubs.Reader.TryRead(out _), "stale reply must not have registered its channel ID");
 
             // The same reply stamped with the current generation applies normally.
-            Assert.True(sub.HandleSubscribeReply(staleResult, _client.ConnectionGeneration));
+            Assert.True(sub.HandleSubscribeReply(staleResult, sub.Epoch, _client.ConnectionGeneration, attempt: 0));
             await _server.PublishIdAsync(77, Encoding.UTF8.GetBytes("{\"applied\":true}"));
             pub = await pubs.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
             Assert.Equal("{\"applied\":true}", Encoding.UTF8.GetString(pub.Data.Span));

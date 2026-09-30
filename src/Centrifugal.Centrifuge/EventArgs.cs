@@ -206,6 +206,10 @@ namespace Centrifugal.Centrifuge
             ConnInfo = connInfo;
             ChanInfo = chanInfo;
         }
+
+        /// <summary>The client info of a protocol message.</summary>
+        internal static CentrifugeClientInfo FromProtocol(Protocol.ClientInfo info) =>
+            new CentrifugeClientInfo(info.User, info.Client, info.ConnInfo.ToByteArray(), info.ChanInfo.ToByteArray());
     }
 
     /// <summary>
@@ -435,10 +439,12 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         public ulong Offset { get; }
 
+        private readonly string? _epoch;
+
         /// <summary>
-        /// Gets the epoch identifier.
+        /// Gets the epoch identifier; empty for a default position.
         /// </summary>
-        public string Epoch { get; }
+        public string Epoch => _epoch ?? string.Empty;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="CentrifugeStreamPosition"/> struct.
@@ -446,7 +452,16 @@ namespace Centrifugal.Centrifuge
         public CentrifugeStreamPosition(ulong offset, string epoch)
         {
             Offset = offset;
-            Epoch = epoch ?? string.Empty;
+            _epoch = epoch ?? string.Empty;
+        }
+
+        /// <summary>The position past a publication, or null when it isn't newer. A publication's epoch, when
+        /// set, is the stream's (a channel without a stream at subscribe gets it with its first publication,
+        /// as centrifuge-js).</summary>
+        internal CentrifugeStreamPosition? Past(ulong offset, string epoch)
+        {
+            var streamEpoch = string.IsNullOrEmpty(epoch) ? Epoch : epoch;
+            return streamEpoch == Epoch && offset <= Offset ? null : new CentrifugeStreamPosition(offset, streamEpoch);
         }
     }
 

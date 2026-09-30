@@ -103,6 +103,9 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         public Func<string, Task<CentrifugeStreamPosition>>? GetState { get; set; }
 
+        /// <summary>A copy taken by the subscription at creation: later changes to these options don't reach it.</summary>
+        internal CentrifugeSubscriptionOptions Clone() => (CentrifugeSubscriptionOptions)MemberwiseClone();
+
         /// <summary>
         /// Validates the options.
         /// </summary>
@@ -116,6 +119,11 @@ namespace Centrifugal.Centrifuge
             if (MaxResubscribeDelay < MinResubscribeDelay)
             {
                 throw new CentrifugeConfigurationException("MaxResubscribeDelay must be >= MinResubscribeDelay");
+            }
+
+            if (MaxResubscribeDelay > Utilities.MaxTimerInterval)
+            {
+                throw new CentrifugeConfigurationException("MaxResubscribeDelay must not exceed Int32.MaxValue milliseconds");
             }
 
             if (!string.IsNullOrEmpty(Delta) && Delta != "fossil")

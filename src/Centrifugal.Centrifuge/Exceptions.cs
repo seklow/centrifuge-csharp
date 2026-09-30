@@ -26,6 +26,10 @@ namespace Centrifugal.Centrifuge
             Code = code;
             Temporary = temporary;
         }
+
+        /// <summary>The exception of a server error reply.</summary>
+        internal static CentrifugeException FromReply(Protocol.Error error) =>
+            new CentrifugeException((int)error.Code, error.Message, error.Temporary);
     }
 
     /// <summary>

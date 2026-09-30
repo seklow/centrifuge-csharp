@@ -10,10 +10,63 @@ namespace Centrifugal.Centrifuge.Tests
     /// </summary>
     public class ClientTests
     {
-        [Fact]
-        public void Client_Constructor_ThrowsOnEmptyEndpoint()
+        /// <summary>An endpoint no transport could connect to is a configuration error at construction,
+        /// not endless connect attempts.</summary>
+        [Theory]
+        [InlineData("")]
+        [InlineData("ws://")]
+        [InlineData("http://[")]
+        [InlineData("ws://exa mple.com/connection/websocket")]
+        [InlineData("http://host:99999/connection/http_stream")]
+        [InlineData("/connection/websocket")]
+        [InlineData("ftp://host/connection")]
+        public void Client_Constructor_ThrowsOnMalformedEndpoint(string endpoint)
         {
-            Assert.Throws<ArgumentException>(() => new CentrifugeClient(""));
+            Assert.Throws<ArgumentException>(() => new CentrifugeClient(endpoint));
+            Assert.Throws<ArgumentException>(() => new CentrifugeClient(new[]
+            {
+                new CentrifugeTransportEndpoint(CentrifugeTransportType.WebSocket, "ws://localhost:8000/connection/websocket"),
+                new CentrifugeTransportEndpoint(CentrifugeTransportType.HttpStream, endpoint),
+            }));
+        }
+
+        /// <summary>A native HTTP stream can't send to such an emulation endpoint: every command after
+        /// connect would fail and reconnect the session. A WebSocket-only client doesn't use it.</summary>
+        [Theory]
+        [InlineData("/emulation")]
+        [InlineData("ws://localhost:8000/emulation")]
+        [InlineData("http://[")]
+        public void Client_Constructor_ThrowsOnMalformedEmulationEndpoint(string emulationEndpoint)
+        {
+            var options = new CentrifugeClientOptions { EmulationEndpoint = emulationEndpoint };
+
+            Assert.Throws<CentrifugeConfigurationException>(
+                () => new CentrifugeClient("http://localhost:8000/connection/http_stream", options));
+            using var webSocketOnly = new CentrifugeClient("ws://localhost:8000/connection/websocket", options);
+        }
+
+        /// <summary>The default emulation endpoint is the root-level /emulation of the endpoint's host; a
+        /// relative (browser) endpoint keeps it relative to the page — outside Windows its rooted path
+        /// parses as an absolute file: URI.</summary>
+        [Theory]
+        [InlineData("/connection/http_stream", "/emulation")]
+        [InlineData("https://host:8443/prefix/connection/http_stream", "https://host:8443/emulation")]
+        public void EmulationEndpoint_DefaultsToRootOfEndpointHost(string endpoint, string expected)
+        {
+            using var client = new CentrifugeClient("ws://localhost:8000/connection/websocket");
+            var emulationEndpointFor = typeof(CentrifugeClient).GetMethod(
+                "EmulationEndpointFor", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!;
+
+            Assert.Equal(expected, emulationEndpointFor.Invoke(client, new object[] { endpoint }));
+        }
+
+        [Fact]
+        public void Client_Constructor_ThrowsOnFallbackEndpointOfAnotherTransport()
+        {
+            Assert.Throws<ArgumentException>(() => new CentrifugeClient(new[]
+            {
+                new CentrifugeTransportEndpoint(CentrifugeTransportType.HttpStream, "ws://localhost:8000/connection/websocket"),
+            }));
         }
 
         [Fact]
@@ -163,6 +216,18 @@ namespace Centrifugal.Centrifuge.Tests
             {
                 Timeout = TimeSpan.FromMilliseconds(-1)
             };
+
+            Assert.Throws<CentrifugeConfigurationException>(() => options.Validate());
+        }
+
+        [Theory]
+        [InlineData(nameof(CentrifugeClientOptions.Timeout))]
+        [InlineData(nameof(CentrifugeClientOptions.OpenTimeout))]
+        [InlineData(nameof(CentrifugeClientOptions.MaxReconnectDelay))]
+        public void ClientOptions_Validate_ThrowsOnIntervalBeyondTimerRange(string option)
+        {
+            var options = new CentrifugeClientOptions();
+            typeof(CentrifugeClientOptions).GetProperty(option)!.SetValue(options, TimeSpan.FromDays(30));
 
             Assert.Throws<CentrifugeConfigurationException>(() => options.Validate());
         }

@@ -59,6 +59,13 @@ namespace Centrifugal.Centrifuge
         public TimeSpan Timeout { get; set; } = TimeSpan.FromSeconds(5);
 
         /// <summary>
+        /// Gets or sets the deadline of a transport open (WebSocket handshake, HTTP stream
+        /// response): an open that takes longer is abandoned and the next connect attempt scheduled.
+        /// Default is 10 seconds.
+        /// </summary>
+        public TimeSpan OpenTimeout { get; set; } = TimeSpan.FromSeconds(10);
+
+        /// <summary>
         /// Gets or sets the maximum delay of server pings to detect broken connection.
         /// Default is 10 seconds.
         /// </summary>
@@ -88,9 +95,14 @@ namespace Centrifugal.Centrifuge
         /// <summary>
         /// Gets or sets the emulation endpoint for SSE and HTTP Stream transports.
         /// This endpoint is used to send commands when using unidirectional transports.
-        /// If not set, will be auto-constructed from the transport endpoint by replacing the last path segment with "emulation".
+        /// If not set, it is the root-level /emulation of the transport endpoint's host (Centrifugo's
+        /// default); set it when the server is routed under a path prefix. With an HTTP streaming endpoint
+        /// it must be an absolute http/https URL — in the browser also one relative to the page.
         /// </summary>
         public string? EmulationEndpoint { get; set; }
+
+        /// <summary>A copy taken by the client at creation: later changes to these options don't reach it.</summary>
+        internal CentrifugeClientOptions Clone() => (CentrifugeClientOptions)MemberwiseClone();
 
         /// <summary>
         /// Validates the options.
@@ -107,14 +119,29 @@ namespace Centrifugal.Centrifuge
                 throw new CentrifugeConfigurationException("MaxReconnectDelay must be >= MinReconnectDelay");
             }
 
-            if (Timeout <= TimeSpan.Zero)
+            if (MaxReconnectDelay > Utilities.MaxTimerInterval)
             {
-                throw new CentrifugeConfigurationException("Timeout must be positive");
+                throw new CentrifugeConfigurationException("MaxReconnectDelay must not exceed Int32.MaxValue milliseconds");
+            }
+
+            if (Timeout <= TimeSpan.Zero || Timeout > Utilities.MaxTimerInterval)
+            {
+                throw new CentrifugeConfigurationException("Timeout must be positive and not exceed Int32.MaxValue milliseconds");
+            }
+
+            if (OpenTimeout <= TimeSpan.Zero || OpenTimeout > Utilities.MaxTimerInterval)
+            {
+                throw new CentrifugeConfigurationException("OpenTimeout must be positive and not exceed Int32.MaxValue milliseconds");
             }
 
             if (MaxServerPingDelay <= TimeSpan.Zero)
             {
                 throw new CentrifugeConfigurationException("MaxServerPingDelay must be positive");
+            }
+
+            if (Name == null || Version == null || (Headers != null && Headers.ContainsValue(null!)))
+            {
+                throw new CentrifugeConfigurationException("Name, Version and header values must not be null");
             }
         }
     }

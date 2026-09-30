@@ -115,7 +115,7 @@ var result = await client.RpcAsync("method", data);
 
 ### ⚠️ Important: Use Async Event Handlers
 
-The SDK invokes event handlers **synchronously** on the transport's receive thread to preserve message ordering. For best performance and responsiveness, keep callbacks fast or use `async void` event handlers:
+The SDK invokes event handlers **synchronously** on the transport's receive thread to preserve message ordering. This includes the outcome of connect and subscribe commands: `Connected` (with the server-side subscription events and recovered publications it carries) and a subscription's `Subscribed` (followed by its recovered publications) are raised before any publication received after the corresponding reply. For best performance and responsiveness, keep callbacks fast or use `async void` event handlers:
 
 ```csharp
 client.Connected += async (sender, e) =>
@@ -148,15 +148,30 @@ Event handlers run on the receive thread. When you block waiting for `PublishAsy
 4. **The receive thread can't process the reply because it's blocked in your callback**
 5. **Deadlock!** ⚠️
 
-**Exception Handling in Event Handlers**
+This applies to every event raised on the receive thread: the push events (`Publication`, `Join`, `Leave`, `Message`, server-side subscription pushes); the events a connect or subscribe reply produces (`Connected`, a subscription's `Subscribed`, the server-side subscription events and recovered publications they carry, and their `StateChanged`); and the lifecycle events of a transport error or close and of a server `Disconnect` or `Unsubscribe` push (`Error`, `Connecting`, `Disconnected`, `Subscribing`, `Unsubscribed`, `ServerSubscribing` and their `StateChanged`). While such a handler runs, the client reads nothing from the connection: no replies to other commands, no pings, no publications of other subscriptions. So any synchronous wait in it for something that needs the connection deadlocks — including marshalling synchronously (`Dispatcher.Invoke`, `Control.Invoke`, `SynchronizationContext.Send`) to a thread that itself waits for the SDK, e.g. blocks on `ReadyAsync()`. Replies that arrive while a handler runs are processed only after it returns, and that time counts against `Timeout` (a reply received together with the handled message doesn't time out): keep handlers fast, and post to the UI thread asynchronously (`BeginInvoke`, `SynchronizationContext.Post`).
 
-**The SDK is not responsible for exceptions raised inside event handlers and does not provide specified behaviour if the one occurs.** You must handle all exceptions in your own code:
+Calling `Disconnect()`, `Dispose()` or `DisposeAsync()` from a handler is safe: the SDK doesn't wait for the receive thread the handler runs on, so these return before that connection is closed.
+
+Events are raised on the thread that makes the transition: transitions made at once on different threads (e.g. `Disconnect()` while a ping timeout reconnects) may deliver their events in either order, and `State` holds the outcome.
+
+**Completing Your Own Tasks from Event Handlers**
+
+If a handler completes a `TaskCompletionSource` that other code awaits, create it with `TaskCreationOptions.RunContinuationsAsynchronously`. Otherwise the awaiting code resumes synchronously inside the handler, on the receive thread, and holds up message processing — or deadlocks if it then blocks on an SDK method:
 
 ```csharp
-// ❌ BAD: Unhandled exceptions - behavior is undefined
+var subscribed = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+subscription.Subscribed += (sender, e) => subscribed.TrySetResult(true);
+```
+
+**Exception Handling in Event Handlers**
+
+An exception a handler throws synchronously is reported through the `Error` event of the client or subscription (its `Type` is the name of the event whose handler threw, e.g. `publication`, `subscribing`) and doesn't alter the SDK: the other handlers of that event, the transition, reconnect and the events that follow still run. The SDK can't catch what an `async void` handler throws after its first `await` — that crashes the application. Handle exceptions in your own code:
+
+```csharp
+// ❌ BAD: throws after the first await - crashes the application
 subscription.Publication += async (sender, e) =>
 {
-    await riskyOperation();  // If this throws - undefined behavior!
+    await riskyOperation();
 };
 
 // ✅ GOOD: Always wrap your logic in try-catch
@@ -174,8 +189,6 @@ subscription.Publication += async (sender, e) =>
 };
 ```
 
-Unhandled exceptions may crash your application, close the transport, or cause other unpredictable behavior. Always handle exceptions in your event handlers.
-
 **Best Practices Summary**
 
 1. ✅ Use `async void` for event handlers that need to perform async operations
@@ -183,6 +196,7 @@ Unhandled exceptions may crash your application, close the transport, or cause o
 3. ✅ Always wrap `async void` handlers in `try-catch` to prevent application crashes
 4. ✅ Keep handlers fast - heavy CPU work should be offloaded to background tasks
 5. ✅ Message order is preserved - handlers are invoked synchronously on the receive thread
+6. ✅ Create a `TaskCompletionSource` completed from a handler with `TaskCreationOptions.RunContinuationsAsynchronously`
 
 ## Subscriptions
 
@@ -357,8 +371,10 @@ var options = new CentrifugeClientOptions
     MinReconnectDelay = TimeSpan.FromMilliseconds(500),
     MaxReconnectDelay = TimeSpan.FromSeconds(20),
 
-    // Timeouts
+    // Timeouts: Timeout bounds a command's write and then its reply — a command waiting behind
+    // earlier sends doesn't time out in the queue; OpenTimeout bounds a transport open
     Timeout = TimeSpan.FromSeconds(5),
+    OpenTimeout = TimeSpan.FromSeconds(10),
     MaxServerPingDelay = TimeSpan.FromSeconds(10),
 
     // Logging (pass ILogger for debug output)
@@ -373,6 +389,13 @@ var options = new CentrifugeClientOptions
 
 var client = new CentrifugeClient("ws://localhost:8000/connection/websocket", options);
 ```
+
+Options are validated when the client or subscription is created (`CentrifugeConfigurationException`): delays can't
+be negative and a maximum delay can't be below its minimum; `Timeout` and `OpenTimeout` must be
+positive; `Timeout`, `OpenTimeout`, `MaxReconnectDelay` and a subscription's `MaxResubscribeDelay`
+can't exceed `Int32.MaxValue` milliseconds; with an HTTP streaming endpoint, `EmulationEndpoint` must be
+an absolute http/https URL. In the browser, fallback endpoints and `EmulationEndpoint` may also be
+relative to the page.
 
 ### Recovery and Positioning
 

@@ -1,6 +1,8 @@
 using System;
+using System.Buffers.Text;
 using System.Collections.Generic;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
@@ -172,6 +174,8 @@ namespace Centrifugal.Centrifuge.Tests
             await disconnectedEvent.Task.WaitAsync(TimeSpan.FromSeconds(5));
         }
 
+        /// <summary>Unsubscribed is raised once the unsubscribe is queued, so the server-side presence
+        /// is awaited until it catches up.</summary>
         [Theory]
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task SubscribeAndUnsubscribeLoop(CentrifugeTransportType transport, string endpoint)
@@ -227,6 +231,12 @@ namespace Centrifugal.Centrifuge.Tests
             await unsubscribedEvent2.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             var presenceStats2 = await client.PresenceStatsAsync("test2");
+            var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(5);
+            while (presenceStats2.NumClients != 0 && DateTime.UtcNow < deadline)
+            {
+                await Task.Delay(20);
+                presenceStats2 = await client.PresenceStatsAsync("test2");
+            }
             Assert.Equal(0u, presenceStats2.NumClients);
             Assert.Equal(0u, presenceStats2.NumUsers);
 
@@ -740,9 +750,8 @@ namespace Centrifugal.Centrifuge.Tests
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task SubscriptionRetriesAfterMultipleGetTokenErrors(CentrifugeTransportType transport, string endpoint)
         {
-            // GetToken throws 3 times, succeeds on 4th call.
-            // Bug: ScheduleResubscribeAsync doesn't catch errors from its inner retry, so
-            // after the 2nd failure the subscription is permanently stuck in Subscribing state.
+            // GetToken throws 3 times, succeeds on 4th call: every failure is retried after a
+            // backoff, the subscription doesn't get stuck in Subscribing.
             int callCount = 0;
             var subOptions = new CentrifugeSubscriptionOptions
             {
@@ -751,7 +760,7 @@ namespace Centrifugal.Centrifuge.Tests
                     Interlocked.Increment(ref callCount);
                     if (callCount < 4)
                         throw new Exception("token error");
-                    return ""; // insecure mode — empty token accepted
+                    return SubscriptionToken(channel);
                 },
                 MinResubscribeDelay = TimeSpan.FromMilliseconds(1),
                 MaxResubscribeDelay = TimeSpan.FromMilliseconds(50)
@@ -805,7 +814,7 @@ namespace Centrifugal.Centrifuge.Tests
             // Bug: this calls StartConnectingAsync (opens transport) then CleanupTransportAsync
             // (destroys it), leaving OnTransportOpened racing with ScheduleReconnectAsync.
             // Fix: directly transitions state without creating a throwaway transport.
-            await client.HandleSubscribeTimeoutAsync();
+            client.HandleSubscribeTimeout(client.ConnectionGeneration);
 
             await reconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
             await resubscribedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -847,7 +856,7 @@ namespace Centrifugal.Centrifuge.Tests
             await sub.ReadyAsync();
 
             // Simulate what the ping timer fires when server stops pinging.
-            await client.HandleNoPingAsync();
+            NoPing.Fire(client);
 
             // Subscription must cycle through Subscribing → Subscribed on the fresh connection.
             await movedToSubscribingTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -861,12 +870,10 @@ namespace Centrifugal.Centrifuge.Tests
 
         [Theory]
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
-        public async Task ResubscribeAsync_GetTokenUnauthorized_DoesNotDeadlock(CentrifugeTransportType transport, string endpoint)
+        public async Task Resubscribe_GetTokenUnauthorized_DoesNotDeadlock(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug: ResubscribeAsync holds _stateLock while awaiting StartSubscribingAsync.
-            // When GetToken throws CentrifugeUnauthorizedException, SetUnsubscribedAsync
-            // tries to acquire the same _stateLock → deadlock.
-            // Fix: replace _stateLock hold with a quick _stateChangeLock check only.
+            // A resubscribe whose GetToken is unauthorized unsubscribes: no lock is held across
+            // the attempt, so the unsubscribe doesn't deadlock.
             int callCount = 0;
             var subOptions = new CentrifugeSubscriptionOptions
             {
@@ -875,7 +882,7 @@ namespace Centrifugal.Centrifuge.Tests
                     int n = Interlocked.Increment(ref callCount);
                     if (n >= 2)
                         throw new CentrifugeUnauthorizedException("unauthorized");
-                    return ""; // insecure mode — empty token accepted on first call
+                    return SubscriptionToken(channel);
                 }
             };
 
@@ -890,9 +897,12 @@ namespace Centrifugal.Centrifuge.Tests
 
             // Without fix: deadlocks → never returns within 3 seconds
             // With fix: SetUnsubscribedAsync runs, sub becomes Unsubscribed
-            await sub.ResubscribeAsync().WaitAsync(TimeSpan.FromSeconds(3));
-
-            Assert.Equal(CentrifugeSubscriptionState.Unsubscribed, sub.State);
+            var unsubscribed = new TaskCompletionSource<CentrifugeUnsubscribedEventArgs>(TaskCreationOptions.RunContinuationsAsynchronously);
+            sub.Unsubscribed += (_, e) => unsubscribed.TrySetResult(e);
+            sub.Resubscribe(CentrifugeUnsubscribedCodes.StateInvalidated, "state invalidated");
+            var args = await unsubscribed.Task.WaitAsync(TimeSpan.FromSeconds(3));
+            Assert.Equal(CentrifugeUnsubscribedCodes.Unauthorized, args.Code);
+            Assert.Equal(2, callCount);
             client.Disconnect();
         }
 
@@ -921,7 +931,7 @@ namespace Centrifugal.Centrifuge.Tests
                 GetToken = async (channel) =>
                 {
                     int n = Interlocked.Increment(ref callCount);
-                    if (n == 1) throw new Exception("transient token error"); // → ScheduleResubscribeAsync
+                    if (n == 1) throw new Exception("transient token error"); // → resubscribe backoff
                     await Task.Delay(Timeout.Infinite, parkCts.Token); // park stray pipelines
                     throw new OperationCanceledException();
                 },
@@ -940,14 +950,14 @@ namespace Centrifugal.Centrifuge.Tests
             sub.Subscribe();
 
             // Eventual check: wait until the GetToken(1) failure has propagated through the
-            // subscribe pipeline and ScheduleResubscribeAsync has armed the retry.
+            // subscribe pipeline and the resubscribe backoff is armed.
             await WaitUntilAsync(() => sub.HasPendingResubscribe, "resubscribe retry to be armed");
 
             // Directly call MoveToSubscribing (simulates what transport reconnect code does
             // when the subscription is already Subscribing).
             // Without fix: state != Subscribed → returns early, _resubscribeCts NOT cancelled.
             // With fix: cancels _resubscribeCts, disarming the pending retry.
-            sub.MoveToSubscribing(CentrifugeConnectingCodes.TransportClosed, "transport closed");
+            sub.MoveToSubscribing(CentrifugeConnectingCodes.TransportClosed, "transport closed", invalidateState: false, client.ConnectionGeneration);
 
             // The cancel happens synchronously inside MoveToSubscribing, and only the
             // single GetToken(1) failure can ever arm a retry — so this is deterministic;
@@ -958,6 +968,15 @@ namespace Centrifugal.Centrifuge.Tests
 
             parkCts.Cancel(); // release any parked stray pipeline before teardown
             client.Disconnect();
+        }
+
+        /// <summary>Subscription token of <paramref name="channel"/> signed with the test server's HMAC secret.</summary>
+        private static string SubscriptionToken(string channel)
+        {
+            var header = Base64Url.EncodeToString(Encoding.UTF8.GetBytes("{\"alg\":\"HS256\",\"typ\":\"JWT\"}"));
+            var payload = Base64Url.EncodeToString(Encoding.UTF8.GetBytes($"{{\"channel\":\"{channel}\"}}"));
+            var signature = HMACSHA256.HashData(Encoding.UTF8.GetBytes("secret"), Encoding.UTF8.GetBytes($"{header}.{payload}"));
+            return $"{header}.{payload}.{Base64Url.EncodeToString(signature)}";
         }
 
         private static async Task WaitUntilAsync(Func<bool> condition, string description, int timeoutMs = 5000)
@@ -977,14 +996,9 @@ namespace Centrifugal.Centrifuge.Tests
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task SendSubscribeCommand_DoesNotSendAfterUnsubscribeDuringGetToken(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug: SendSubscribeCommandAsync has no state re-check after awaiting GetToken.
-            // If Unsubscribe() is called while GetToken awaits, the method continues and
-            // sends a Subscribe command to the server despite the sub being Unsubscribed,
-            // creating a phantom server-side subscription that delivers publications to
-            // the client after the client has locally unsubscribed.
-            //
-            // Fix: add lock(_stateChangeLock) { if (_state != Subscribing) return; } after
-            // the GetToken await.
+            // An Unsubscribe() while the attempt awaits GetToken supersedes it: the attempt
+            // re-checks its epoch after GetToken and sends no Subscribe, so no phantom
+            // server-side subscription delivers publications after the local unsubscribe.
 
             var getTokenGate = new SemaphoreSlim(0, 1);
             var getTokenCalledTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1002,7 +1016,7 @@ namespace Centrifugal.Centrifuge.Tests
                         getTokenCalledTcs.TrySetResult(true);
                         await getTokenGate.WaitAsync(); // block until released
                     }
-                    return ""; // insecure mode — empty token accepted
+                    return SubscriptionToken(channel);
                 }
             };
 
@@ -1017,13 +1031,13 @@ namespace Centrifugal.Centrifuge.Tests
             var unsubscribedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             sub.Unsubscribed += (_, _) => unsubscribedTcs.TrySetResult(true);
 
-            // GetToken(1) returns "" → sub becomes Subscribed on server
+            // GetToken(1) returns the token → sub becomes Subscribed on server
             sub.Subscribe();
             await sub.ReadyAsync();
             Assert.Equal(CentrifugeSubscriptionState.Subscribed, sub.State);
 
-            // Trigger resubscribe → SendSubscribeCommandAsync → GetToken(2) blocks on gate
-            _ = sub.ResubscribeAsync();
+            // Resubscribe dropping the token → GetToken(2) blocks on gate
+            sub.Resubscribe(CentrifugeUnsubscribedCodes.StateInvalidated, "state invalidated");
             await getTokenCalledTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             // While GetToken(2) is blocked, unsubscribe — sets local state to Unsubscribed
@@ -1036,8 +1050,7 @@ namespace Centrifugal.Centrifuge.Tests
             // route publications to us (proving the bug).
             await Task.Delay(500);
 
-            // Release the gate — without the fix, SendSubscribeCommandAsync skips the state
-            // check and sends a Subscribe to the server (phantom subscription)
+            // Release the gate — the superseded attempt must not send a Subscribe
             getTokenGate.Release();
             await Task.Delay(500); // let any phantom Subscribe be processed by the server
 
@@ -1135,9 +1148,9 @@ namespace Centrifugal.Centrifuge.Tests
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task HandleNoPing_AfterDisconnect_DoesNotSpuriouslyReconnect(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug 21: HandleNoPingAsync checks _state == Disconnected outside _stateChangeLock.
+            // Bug 21: the no-ping handler checks _state == Disconnected outside _stateChangeLock.
             // Race: Disconnect() sets state=Disconnected between the check and SetState(Connecting),
-            // causing HandleNoPingAsync to overwrite Disconnected with Connecting and trigger a
+            // causing the handler to overwrite Disconnected with Connecting and trigger a
             // spurious reconnect attempt.
             // Fix: both check and SetState are inside lock(_stateChangeLock).
             //
@@ -1153,24 +1166,19 @@ namespace Centrifugal.Centrifuge.Tests
                 client.Connect();
                 await client.ReadyAsync();
 
-                var spuriousConnecting = false;
                 var disconnectedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 client.Disconnected += (_, _) => disconnectedTcs.TrySetResult(true);
-                client.Connecting += (_, _) =>
-                {
-                    if (disconnectedTcs.Task.IsCompleted) spuriousConnecting = true;
-                };
 
+                var session = NoPing.Transport(client)!;
                 await Task.WhenAll(
-                    client.HandleNoPingAsync(),
+                    Task.Run(() => client.NoPing(session)),
                     Task.Run(() => client.Disconnect())
                 );
 
                 await disconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 await Task.Delay(50); // let any spurious ScheduleReconnectAsync start
 
-                Assert.False(spuriousConnecting, $"iteration {i}: spurious Connecting after Disconnect");
-                Assert.Equal(CentrifugeClientState.Disconnected, client.State);
+                Assert.True(client.State == CentrifugeClientState.Disconnected, $"iteration {i}: spurious reconnect after Disconnect");
             }
         }
 
@@ -1178,7 +1186,7 @@ namespace Centrifugal.Centrifuge.Tests
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task HandleSubscribeTimeout_AfterDisconnect_DoesNotSpuriouslyReconnect(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug 22: same unlocked race in HandleSubscribeTimeoutAsync. Fix: same lock pattern.
+            // Bug 22: same unlocked race in HandleSubscribeTimeout. Fix: same lock pattern.
             for (int i = 0; i < 50; i++)
             {
                 using var client = CreateClient(transport, endpoint, new CentrifugeClientOptions
@@ -1189,24 +1197,19 @@ namespace Centrifugal.Centrifuge.Tests
                 client.Connect();
                 await client.ReadyAsync();
 
-                var spuriousConnecting = false;
                 var disconnectedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 client.Disconnected += (_, _) => disconnectedTcs.TrySetResult(true);
-                client.Connecting += (_, _) =>
-                {
-                    if (disconnectedTcs.Task.IsCompleted) spuriousConnecting = true;
-                };
 
+                var generation = client.ConnectionGeneration;
                 await Task.WhenAll(
-                    client.HandleSubscribeTimeoutAsync(),
+                    Task.Run(() => client.HandleSubscribeTimeout(generation)),
                     Task.Run(() => client.Disconnect())
                 );
 
                 await disconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 await Task.Delay(50);
 
-                Assert.False(spuriousConnecting, $"iteration {i}: spurious Connecting after Disconnect");
-                Assert.Equal(CentrifugeClientState.Disconnected, client.State);
+                Assert.True(client.State == CentrifugeClientState.Disconnected, $"iteration {i}: spurious reconnect after Disconnect");
             }
         }
 
@@ -1214,7 +1217,7 @@ namespace Centrifugal.Centrifuge.Tests
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
         public async Task HandleUnsubscribeError_AfterDisconnect_DoesNotSpuriouslyReconnect(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug 23: same unlocked race in HandleUnsubscribeErrorAsync. Fix: same lock pattern.
+            // Bug 23: same unlocked race in HandleUnsubscribeError. Fix: same lock pattern.
             for (int i = 0; i < 50; i++)
             {
                 using var client = CreateClient(transport, endpoint, new CentrifugeClientOptions
@@ -1225,24 +1228,19 @@ namespace Centrifugal.Centrifuge.Tests
                 client.Connect();
                 await client.ReadyAsync();
 
-                var spuriousConnecting = false;
                 var disconnectedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
                 client.Disconnected += (_, _) => disconnectedTcs.TrySetResult(true);
-                client.Connecting += (_, _) =>
-                {
-                    if (disconnectedTcs.Task.IsCompleted) spuriousConnecting = true;
-                };
 
+                var generation = client.ConnectionGeneration;
                 await Task.WhenAll(
-                    client.HandleUnsubscribeErrorAsync(),
+                    Task.Run(() => client.HandleUnsubscribeError(generation)),
                     Task.Run(() => client.Disconnect())
                 );
 
                 await disconnectedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
                 await Task.Delay(50);
 
-                Assert.False(spuriousConnecting, $"iteration {i}: spurious Connecting after Disconnect");
-                Assert.Equal(CentrifugeClientState.Disconnected, client.State);
+                Assert.True(client.State == CentrifugeClientState.Disconnected, $"iteration {i}: spurious reconnect after Disconnect");
             }
         }
 
@@ -1281,7 +1279,10 @@ namespace Centrifugal.Centrifuge.Tests
             client.Disconnected += (_, _) => disconnectedTcs.TrySetResult(true);
 
             // Trigger the refresh path directly — GetToken(2) will block on the gate
-            _ = client.RefreshConnectionTokenAsync();
+            var epoch = (int)typeof(CentrifugeClient)
+                .GetField("_epoch", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
+                .GetValue(client)!;
+            _ = client.RefreshConnectionTokenAsync(epoch);
             await getTokenCalledTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             // Disconnect while GetToken(2) is blocked — sets local state to Disconnected
@@ -1321,7 +1322,7 @@ namespace Centrifugal.Centrifuge.Tests
                         getTokenCalledTcs.TrySetResult(true);
                         await getTokenGate.WaitAsync();
                     }
-                    return ""; // insecure mode
+                    return SubscriptionToken(channel);
                 }
             };
 
@@ -1338,7 +1339,7 @@ namespace Centrifugal.Centrifuge.Tests
             sub.Unsubscribed += (_, _) => unsubscribedTcs.TrySetResult(true);
 
             // Trigger the token refresh path directly — GetToken(2) blocks
-            _ = sub.RefreshTokenAsync();
+            _ = sub.RefreshTokenAsync(sub.Epoch, client.ConnectionGeneration);
             await getTokenCalledTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             // Unsubscribe while GetToken(2) is blocked
@@ -1359,15 +1360,11 @@ namespace Centrifugal.Centrifuge.Tests
 
         [Theory]
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
-        public async Task ResubscribeAsync_AfterUnsubscribe_DoesNotOverwriteUnsubscribedState(CentrifugeTransportType transport, string endpoint)
+        public async Task Resubscribe_AfterUnsubscribe_DoesNotOverwriteUnsubscribedState(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug 28: StartSubscribingAsync called SetState(Subscribing) without _stateChangeLock.
-            // Race: ResubscribeAsync (server temp-unsub path) releases the lock after checking state,
-            // then Unsubscribe() runs and sets state to Unsubscribed, then StartSubscribingAsync
-            // overwrites Unsubscribed with Subscribing — subscription stuck in wrong state.
-            // Fix: SetState(Subscribing) is now inside lock(_stateChangeLock) with re-check.
-            //
-            // Run 50 concurrent iterations. With the fix every iteration ends Unsubscribed.
+            // A resubscribe (server temporary unsubscribe) racing Unsubscribe() must not overwrite
+            // Unsubscribed with Subscribing: its check and transition are one critical section.
+            // 50 concurrent iterations, every one ends Unsubscribed.
             for (int i = 0; i < 50; i++)
             {
                 using var client = CreateClient(transport, endpoint, new CentrifugeClientOptions
@@ -1386,10 +1383,8 @@ namespace Centrifugal.Centrifuge.Tests
                 sub.Unsubscribed += (_, _) => unsubscribedTcs.TrySetResult(true);
 
                 // Fire both concurrently: server-side resubscribe path vs. user unsubscribe.
-                // Without fix: StartSubscribingAsync may overwrite the Unsubscribed state set by
-                // SetUnsubscribedAsync, leaving the subscription stuck in Subscribing.
                 await Task.WhenAll(
-                    sub.ResubscribeAsync(),
+                    Task.Run(() => sub.Resubscribe(CentrifugeSubscribingCodes.TransportClosed, "transport closed")),
                     Task.Run(() => sub.Unsubscribe())
                 );
 
@@ -1403,18 +1398,11 @@ namespace Centrifugal.Centrifuge.Tests
 
         [Theory]
         [MemberData(nameof(GetCentrifugeTransportEndpoints))]
-        public async Task ResubscribeAsync_DoesNotSendDuplicateSubscribe_WhenInflightConcurrent(CentrifugeTransportType transport, string endpoint)
+        public async Task Resubscribe_DoesNotSendDuplicateSubscribe_WhenInflightConcurrent(CentrifugeTransportType transport, string endpoint)
         {
-            // Bug 29: StartSubscribingAsync called SendSubscribeCommandAsync directly, bypassing
-            // the _inflight guard. A concurrent SendSubscribeCommandsAsync from a reconnect batch
-            // could also be calling SendSubscribeCommandAsync, resulting in two simultaneous
-            // Subscribe commands for the same channel.
-            // Fix: StartSubscribingAsync now delegates to SendSubscribeIfNeededAsync which holds
-            // _inflight, preventing the duplicate.
-            //
-            // Test: call ResubscribeAsync while GetToken is blocked, then Unsubscribe while blocked.
-            // With the _inflight + state-fence combo, only one subscribe reaches the server and
-            // no phantom subscribe is sent after Unsubscribe.
+            // A resubscribe runs one attempt at a time (_inflight): a concurrent sweep doesn't send a
+            // second subscribe. Resubscribe while GetToken is blocked, then Unsubscribe while blocked:
+            // only one subscribe reaches the server and none is sent after Unsubscribe.
             var getTokenGate = new SemaphoreSlim(0, 1);
             var getTokenCalledTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             int callCount = 0;
@@ -1430,7 +1418,7 @@ namespace Centrifugal.Centrifuge.Tests
                         getTokenCalledTcs.TrySetResult(true);
                         await getTokenGate.WaitAsync();
                     }
-                    return ""; // insecure mode
+                    return SubscriptionToken(channel);
                 }
             };
 
@@ -1448,8 +1436,8 @@ namespace Centrifugal.Centrifuge.Tests
             var unsubscribedTcs = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
             sub.Unsubscribed += (_, _) => unsubscribedTcs.TrySetResult(true);
 
-            // Trigger resubscribe path → GetToken(2) blocks
-            _ = sub.ResubscribeAsync();
+            // Resubscribe dropping the token → GetToken(2) blocks
+            sub.Resubscribe(CentrifugeUnsubscribedCodes.StateInvalidated, "state invalidated");
             await getTokenCalledTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
             // Unsubscribe while GetToken(2) is blocked
@@ -1761,6 +1749,39 @@ namespace Centrifugal.Centrifuge.Tests
             Assert.NotNull(nextMethod);
             var id = (uint)nextMethod!.Invoke(client, null)!;
             Assert.NotEqual(0u, id);
+        }
+
+        /// <summary>
+        /// The connect reply is applied — and Connected raised — on the receive loop while the
+        /// connect timer runs: a handler slower than the timeout doesn't make the applied reply
+        /// time out (emulation transports wait on a pre-registered call).
+        /// </summary>
+        [Theory]
+        [MemberData(nameof(GetCentrifugeTransportEndpoints))]
+        public async Task SlowConnectedHandlerDoesNotTimeOutAppliedConnectReply(CentrifugeTransportType transport, string endpoint)
+        {
+            var timeout = TimeSpan.FromSeconds(2);
+            using var client = CreateClient(transport, endpoint, new CentrifugeClientOptions
+            {
+                Timeout = timeout,
+            });
+            var errors = 0;
+            var connecting = 0;
+            var connected = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+            client.Error += (_, _) => Interlocked.Increment(ref errors);
+            client.Connecting += (_, _) => Interlocked.Increment(ref connecting);
+            client.Connected += (_, _) =>
+            {
+                Thread.Sleep(timeout + TimeSpan.FromMilliseconds(500));
+                connected.TrySetResult(true);
+            };
+
+            client.Connect();
+            await connected.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            Assert.Equal(0, Volatile.Read(ref errors));
+            Assert.Equal(1, Volatile.Read(ref connecting));
+            Assert.Equal(CentrifugeClientState.Connected, client.State);
         }
     }
 

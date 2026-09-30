@@ -1,5 +1,7 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
 using System.Net.WebSockets;
 using System.Threading;
@@ -19,6 +21,17 @@ namespace Centrifugal.Centrifuge.Transports
         private Task? _receiveTask;
         private readonly SemaphoreSlim _sendLock = new SemaphoreSlim(1, 1);
         private int _disposed;
+        /// <summary>Stopwatch timestamp of a failed write, 0 while none: later writes fail at once, so nothing
+        /// is sent past the lost data.</summary>
+        private long _writeFailedAt;
+        /// <summary>The receive loop's current read (a sequence number) and whether it is waiting on the
+        /// network rather than dispatching: the grace after a failed write counts only network time.</summary>
+        private long _readSeq;
+        private int _reading;
+
+        /// <summary>How long a failed write leaves the receive loop, waiting on the network, to report the
+        /// server's close before the socket is aborted.</summary>
+        private static readonly TimeSpan FailedWriteCloseGrace = TimeSpan.FromSeconds(1);
 
         /// <inheritdoc/>
         public CentrifugeTransportType Type => CentrifugeTransportType.WebSocket;
@@ -33,7 +46,7 @@ namespace Centrifugal.Centrifuge.Transports
         public event EventHandler? Opened;
 
         /// <inheritdoc/>
-        public event EventHandler<byte[]>? MessageReceived;
+        public event EventHandler<IReadOnlyList<byte[]>>? MessageReceived;
 
         /// <inheritdoc/>
         public event EventHandler<TransportClosedEventArgs>? Closed;
@@ -57,6 +70,9 @@ namespace Centrifugal.Centrifuge.Transports
         }
 
         /// <inheritdoc/>
+        /// <remarks>A disposed transport doesn't open: the socket and the receive token source are
+        /// published (full fence) before the disposed checks, so a concurrent Dispose either disposes
+        /// them or is seen here — before connecting or before the receive loop starts.</remarks>
         public async Task OpenAsync(CancellationToken cancellationToken = default, byte[]? initialData = null)
         {
             if (_webSocket != null)
@@ -65,16 +81,24 @@ namespace Centrifugal.Centrifuge.Transports
             }
 
             // WebSocket doesn't use initialData parameter
-            _webSocket = new ClientWebSocket();
-            _webSocket.Options.AddSubProtocol(_subProtocol);
+            var webSocket = new ClientWebSocket();
+            webSocket.Options.AddSubProtocol(_subProtocol);
+            var receiveCts = new CancellationTokenSource();
+            Interlocked.Exchange(ref _receiveCts, receiveCts);
+            Interlocked.Exchange(ref _webSocket, webSocket);
+            if (Volatile.Read(ref _disposed) != 0)
+            {
+                webSocket.Dispose();
+                receiveCts.Dispose();
+                throw new ObjectDisposedException(nameof(WebSocketTransport));
+            }
 
             try
             {
-                await _webSocket.ConnectAsync(_uri, cancellationToken).ConfigureAwait(false);
+                await webSocket.ConnectAsync(_uri, cancellationToken).ConfigureAwait(false);
+                if (Volatile.Read(ref _disposed) != 0) throw new ObjectDisposedException(nameof(WebSocketTransport));
 
-                // Start receive loop
-                _receiveCts = new CancellationTokenSource();
-                _receiveTask = ReceiveLoopAsync(_receiveCts.Token);
+                _receiveTask = ReceiveLoopAsync(receiveCts.Token);
 
                 Opened?.Invoke(this, EventArgs.Empty);
             }
@@ -87,27 +111,55 @@ namespace Centrifugal.Centrifuge.Transports
         }
 
         /// <inheritdoc/>
+        /// <remarks>A write that outlives <paramref name="cancellationToken"/> aborts the socket. A failed one
+        /// fails the later writes at once and leaves the receive loop <see cref="FailedWriteCloseGrace"/> of
+        /// network wait in total to report the server's close (a close frame may already be buffered): the
+        /// read in progress is aborted after it, later reads spend what is left; time spent dispatching
+        /// doesn't count. Either way the receive loop reports the close, once.</remarks>
         public async Task SendAsync(byte[] data, CancellationToken cancellationToken = default)
         {
-            await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+            bool locked = false;
+            var webSocket = _webSocket;
             try
             {
-                if (_webSocket == null || _webSocket.State != WebSocketState.Open)
+                await _sendLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+                locked = true;
+                if (webSocket == null || webSocket.State != WebSocketState.Open || Interlocked.Read(ref _writeFailedAt) != 0)
                 {
                     throw new CentrifugeException(CentrifugeErrorCodes.TransportClosed, "WebSocket is not open");
                 }
 
-                await _webSocket.SendAsync(
+                await webSocket.SendAsync(
                     new ArraySegment<byte>(data),
                     WebSocketMessageType.Binary,
                     true,
                     cancellationToken
                 ).ConfigureAwait(false);
             }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                webSocket?.Abort();
+                throw;
+            }
+            catch (Exception) when (webSocket != null)
+            {
+                if (Interlocked.CompareExchange(ref _writeFailedAt, Stopwatch.GetTimestamp(), 0) == 0
+                    && Volatile.Read(ref _reading) != 0)
+                    _ = AbortReadAfterGraceAsync(webSocket, Interlocked.Read(ref _readSeq));
+                throw;
+            }
             finally
             {
-                _sendLock.Release();
+                if (locked) _sendLock.Release();
             }
+        }
+
+        /// <summary>Aborts the socket if the read <paramref name="readSeq"/>, in progress when a write failed,
+        /// is still waiting on the network after the grace.</summary>
+        private async Task AbortReadAfterGraceAsync(ClientWebSocket webSocket, long readSeq)
+        {
+            await Task.Delay(FailedWriteCloseGrace).ConfigureAwait(false);
+            if (Volatile.Read(ref _reading) != 0 && Interlocked.Read(ref _readSeq) == readSeq) webSocket.Abort();
         }
 
         /// <inheritdoc/>
@@ -117,21 +169,40 @@ namespace Centrifugal.Centrifuge.Transports
         }
 
         /// <inheritdoc/>
+        /// <remarks>The close frame goes first, as a send (after a pending write; bounded): cancelling a
+        /// pending receive aborts the socket, after which it couldn't. CloseOutputAsync only sends it — no
+        /// acknowledgement is awaited, and a receive may run meanwhile. Then the receive loop is cancelled
+        /// and awaited. Close errors are ignored: the connection is torn down anyway.</remarks>
         public async Task CloseAsync()
         {
-            if (_webSocket == null) return;
-
-            // Capture fields as locals to avoid racing with concurrent Dispose().
+            var webSocket = _webSocket;
+            if (webSocket == null) return;
             var cts = _receiveCts;
             var receiveTask = _receiveTask;
 
-            // Cancel the receive loop and wait for it to fully exit BEFORE issuing
-            // any further socket operations. ClientWebSocket allows at most one
-            // outstanding ReceiveAsync; calling CloseAsync (which reads to wait
-            // for the close ack) while ReceiveLoopAsync is still in ReceiveAsync
-            // produces undefined behaviour and has been observed to hang on Linux.
-            try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+            using (var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5)))
+            {
+                bool locked = false;
+                try
+                {
+                    await _sendLock.WaitAsync(closeCts.Token).ConfigureAwait(false);
+                    locked = true;
+                    if (webSocket.State == WebSocketState.Open || webSocket.State == WebSocketState.CloseReceived)
+                    {
+                        await webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client disconnect", closeCts.Token)
+                            .ConfigureAwait(false);
+                    }
+                }
+                catch
+                {
+                }
+                finally
+                {
+                    if (locked) _sendLock.Release();
+                }
+            }
 
+            try { cts?.Cancel(); } catch (ObjectDisposedException) { }
             if (receiveTask != null)
             {
                 try
@@ -140,38 +211,27 @@ namespace Centrifugal.Centrifuge.Transports
                 }
                 catch
                 {
-                    // Receive task exit errors are not actionable here.
                 }
-            }
-
-            try
-            {
-                if (_webSocket.State == WebSocketState.Open || _webSocket.State == WebSocketState.CloseReceived)
-                {
-                    // CloseOutputAsync only sends the close frame; it does not block
-                    // waiting for a server ack. The connection is being torn down
-                    // anyway, so we don't need a clean handshake.
-                    using var closeCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
-                    await _webSocket.CloseOutputAsync(WebSocketCloseStatus.NormalClosure, "Client disconnect", closeCts.Token)
-                        .ConfigureAwait(false);
-                }
-            }
-            catch
-            {
-                // Ignore errors during close
             }
         }
 
         /// <summary>
-        /// Receive loop that processes incoming messages.
+        /// Receive loop that processes incoming messages. Each WebSocket message is raised in order
+        /// as one frame, also the messages before a malformed one; the parse error closes the transport.
+        /// Only the loop's own cancellation is a normal stop: any other cancellation is a failed transport.
+        /// The message buffer returns to ReceiveBufferSize after each message: a large one isn't kept
+        /// allocated, at the cost of growing again for the next. Reads after a failed write share
+        /// <see cref="FailedWriteCloseGrace"/> of network wait (see SendAsync).
         /// </summary>
         private async Task ReceiveLoopAsync(CancellationToken cancellationToken)
         {
             var buffer = ArrayPool<byte>.Shared.Rent(16 * 1024);
             var ms = new MemoryStream();
+            var frame = new List<byte[]>();
             // Capture the socket as a local so a concurrent Dispose nulling _webSocket
             // (future-proofing) can't cause NREs mid-loop.
             var webSocket = _webSocket;
+            var graceLeft = FailedWriteCloseGrace;
 
             try
             {
@@ -179,14 +239,37 @@ namespace Centrifugal.Centrifuge.Transports
                 {
                     WebSocketReceiveResult result;
                     ms.SetLength(0);
+                    if (ms.Capacity > VarintCodec.ReceiveBufferSize) ms.Capacity = VarintCodec.ReceiveBufferSize;
 
                     // Read the complete WebSocket message
                     do
                     {
-                        result = await webSocket.ReceiveAsync(
-                            new ArraySegment<byte>(buffer),
-                            cancellationToken
-                        ).ConfigureAwait(false);
+                        Interlocked.Increment(ref _readSeq);
+                        Interlocked.Exchange(ref _reading, 1);
+                        var readStart = Stopwatch.GetTimestamp();
+                        try
+                        {
+                            if (Interlocked.Read(ref _writeFailedAt) == 0)
+                            {
+                                result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cancellationToken).ConfigureAwait(false);
+                            }
+                            else
+                            {
+                                using var grace = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                                grace.CancelAfter(graceLeft > TimeSpan.Zero ? graceLeft : TimeSpan.Zero);
+                                result = await webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), grace.Token).ConfigureAwait(false);
+                            }
+                        }
+                        finally
+                        {
+                            Volatile.Write(ref _reading, 0);
+                        }
+                        var failedAt = Interlocked.Read(ref _writeFailedAt);
+                        if (failedAt != 0)
+                        {
+                            graceLeft -= TimeSpan.FromSeconds(
+                                (Stopwatch.GetTimestamp() - Math.Max(readStart, failedAt)) / (double)Stopwatch.Frequency);
+                        }
 
                         if (result.MessageType == WebSocketMessageType.Close)
                         {
@@ -200,28 +283,26 @@ namespace Centrifugal.Centrifuge.Transports
                         ms.Write(buffer, 0, result.Count);
                     } while (!result.EndOfMessage);
 
-                    // Process varint-delimited messages within the WebSocket message
-                    ms.Position = 0;
-
-                    while (ms.Position < ms.Length)
+                    try
                     {
-                        byte[]? message = VarintCodec.ReadDelimitedMessage(ms, cancellationToken);
-                        if (message == null) break;
-
-                        // Invoke synchronously to preserve message order
-                        // Exceptions will propagate to outer catch, firing Error and Closed events
-                        MessageReceived?.Invoke(this, message);
+                        var length = (int)ms.Length;
+                        if (VarintCodec.ReadCompleteMessages(ms.GetBuffer(), length, frame) != length)
+                            throw new IOException("Truncated message in WebSocket frame");
+                    }
+                    finally
+                    {
+                        if (frame.Count > 0) MessageReceived?.Invoke(this, frame);
+                        frame.Clear();
                     }
                 }
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
-                // Normal cancellation
             }
             catch (Exception ex)
             {
                 Error?.Invoke(this, ex);
-                Closed?.Invoke(this, new TransportClosedEventArgs(exception: ex));
+                Closed?.Invoke(this, new TransportClosedEventArgs());
             }
             finally
             {
@@ -231,13 +312,14 @@ namespace Centrifugal.Centrifuge.Transports
         }
 
         /// <inheritdoc/>
+        /// <remarks>A concurrent OpenAsync that saw the disposal may have released the token source already.
+        /// The send lock is left undisposed: a sender waiting on it gets it and fails on the closed socket.</remarks>
         public void Dispose()
         {
             if (System.Threading.Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
 
-            _receiveCts?.Cancel();
+            try { _receiveCts?.Cancel(); } catch (ObjectDisposedException) { }
             _receiveCts?.Dispose();
-            _sendLock?.Dispose();
             _webSocket?.Dispose();
         }
     }
