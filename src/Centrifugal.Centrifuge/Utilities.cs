@@ -35,7 +35,7 @@ namespace Centrifugal.Centrifuge
                 timeoutCts = new CancellationTokenSource(timeout.Value);
                 timeoutRegistration = timeoutCts.Token.Register(() =>
                 {
-                    if (_promises.TryRemove(id, out var p)) p.TrySetException(new CentrifugeException(CentrifugeErrorCodes.Timeout, "timeout"));
+                    if (_promises.TryRemove(id, out var p)) p.TrySetException(new CentrifugeTimeoutException("timeout"));
                 });
             }
 

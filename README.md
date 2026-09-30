@@ -238,6 +238,12 @@ await subscription.PublishAsync(message);
 subscription.Unsubscribe();
 ```
 
+`subscription.Dispose()` (or `client.RemoveSubscription(subscription)` for a subscription this client holds)
+unsubscribes it as `Unsubscribe()` does and removes it from the client: `StateChanged` and `Unsubscribed` are raised
+by the call that makes the transition, on its thread, after the unsubscribe command is queued (when the server may
+hold the subscription and the client is connected) and the subscription left the client — so their handler may create
+a new subscription of the channel; one already unsubscribed raises none. A disposed subscription can't subscribe again.
+
 ### Token Authentication
 
 ```csharp
@@ -473,6 +479,11 @@ catch (CentrifugeException ex)
     Console.WriteLine($"Temporary: {ex.Temporary}");
 }
 ```
+
+`CentrifugeTimeoutException` means the client or subscription wasn't ready in time (`ReadyAsync`, also awaited inside
+the calls) or the reply didn't arrive in time; it doesn't tell whether the command reached the server. A write that
+doesn't complete within `Timeout` fails with a `CentrifugeException` of code `TransportWriteError` (or with the error of
+the session that ended meanwhile).
 
 ## Working with JSON Data
 

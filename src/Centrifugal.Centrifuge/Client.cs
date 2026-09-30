@@ -390,7 +390,7 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         private static CentrifugeTransportType TransportOf(string? endpoint, string paramName) =>
             Uri.TryCreate(endpoint, UriKind.Absolute, out var uri)
-                ? uri.Scheme.ToLowerInvariant() switch
+                ? uri.Scheme switch
                 {
                     "ws" or "wss" => CentrifugeTransportType.WebSocket,
                     "http" or "https" => CentrifugeTransportType.HttpStream,
@@ -483,7 +483,8 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         /// <param name="timeout">Optional timeout.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
-        /// <returns>A task that completes when connected.</returns>
+        /// <returns>A task that completes when connected; after <paramref name="timeout"/> it fails with
+        /// <see cref="CentrifugeTimeoutException"/>.</returns>
         /// <exception cref="ArgumentOutOfRangeException">The timeout is negative (other than infinite) or too large for a timer.</exception>
         public Task ReadyAsync(TimeSpan? timeout = null, CancellationToken cancellationToken = default)
         {
@@ -508,7 +509,7 @@ namespace Centrifugal.Centrifuge
 
 
         /// <summary>
-        /// Creates a new subscription to a channel. It is registered before the disposal check, so a
+        /// Creates a new subscription to a channel. It is registered before the final disposal check, so a
         /// concurrent Dispose() either disposes it or makes this throw.
         /// </summary>
         /// <param name="channel">Channel name.</param>
@@ -516,6 +517,7 @@ namespace Centrifugal.Centrifuge
         /// <returns>The subscription instance.</returns>
         public CentrifugeSubscription NewSubscription(string channel, CentrifugeSubscriptionOptions? options = null)
         {
+            ThrowIfDisposed();
             if (string.IsNullOrWhiteSpace(channel))
             {
                 throw new ArgumentException("Channel cannot be null or empty", nameof(channel));
@@ -546,14 +548,16 @@ namespace Centrifugal.Centrifuge
         }
 
         /// <summary>
-        /// Removes a subscription (see <see cref="CentrifugeSubscription.Dispose"/>) — this instance
-        /// only: a newer one of the same channel stays.
+        /// Removes a subscription of this client (see <see cref="CentrifugeSubscription.Dispose"/>) — this
+        /// instance only: a newer one of the same channel stays, and one this client doesn't hold is left
+        /// alone (as centrifuge-js master).
         /// </summary>
         /// <param name="subscription">The subscription to remove.</param>
         public void RemoveSubscription(CentrifugeSubscription subscription)
         {
             if (subscription == null) throw new ArgumentNullException(nameof(subscription));
-            subscription.Dispose();
+            if (ReferenceEquals(GetSubscription(subscription.Channel), subscription))
+                subscription.Dispose();
         }
 
         /// <summary>Removes <paramref name="subscription"/> from the registry if it is still the one of its channel.</summary>
@@ -1356,7 +1360,6 @@ namespace Centrifugal.Centrifuge
             {
                 _logger?.LogDebug("Sending connect command...");
                 await SendConnectCommandAsync(transport).ConfigureAwait(false);
-                _logger?.LogDebug("Connect reply received");
             }
             catch (Exception ex)
             {
@@ -1575,9 +1578,9 @@ namespace Centrifugal.Centrifuge
         /// transition, the resolve of the ready waiters and the server-side subscriptions: a ReadyAsync caller can't
         /// observe Connecting, miss the resolve and register a promise nobody completes. The events
         /// stop once the client moved on (a
-        /// handler disconnected). The subscribe commands of Subscribing subscriptions follow, and
-        /// the batch is flushed: commands queued on this transport while Connecting (calls that passed
-        /// ReadyAsync before the reconnect) would otherwise wait for the next flush trigger.
+        /// handler disconnected). The batch is flushed before the events: commands queued on this
+        /// transport while Connecting (calls that passed ReadyAsync before the reconnect) don't wait
+        /// for the handlers. The subscribe commands of Subscribing subscriptions follow the events.
         /// </summary>
         private void HandleConnectReply(ITransport transport, string sentToken, Reply reply)
         {
@@ -1635,6 +1638,7 @@ namespace Centrifugal.Centrifuge
                 ApplyServerSubscriptionsLocked(connectResult.Subs, out newServerSubs, out removedServerSubs, out keptServerSubs);
             }
 
+            _ = Task.Run(FlushCommandBatchAsync);
             Raise(StateChanged, new CentrifugeStateEventArgs(prevState, CentrifugeClientState.Connected), "stateChanged");
             if (IsCurrentSession(connectedEpoch))
             {
@@ -1650,7 +1654,6 @@ namespace Centrifugal.Centrifuge
             }
 
             ScheduleSubscribeBatch();
-            _ = Task.Run(FlushCommandBatchAsync);
         }
 
         /// <summary>
@@ -3013,10 +3016,11 @@ namespace Centrifugal.Centrifuge
         }
 
         /// <summary>
-        /// Disconnects, then unsubscribes every subscription with ClientClosed whatever state the
-        /// client was in — rejecting their pending ReadyAsync — and releases the resources. The
-        /// subscriptions are a snapshot: a handler may dispose the client reentrantly. Without
-        /// <paramref name="waitClose"/> it completes synchronously, the transport closing on its own.
+        /// Disconnects, then closes every subscription whatever state the client was in — rejecting their
+        /// pending ReadyAsync — with ClientClosed, and releases the resources; one another transition
+        /// already unsubscribed keeps its code and gets no new events. The subscriptions are a snapshot: a
+        /// handler may dispose the client reentrantly. Without <paramref name="waitClose"/> it completes
+        /// synchronously, the transport closing on its own.
         /// </summary>
         private async Task DisposeCoreAsync(bool waitClose = true)
         {
@@ -3031,10 +3035,8 @@ namespace Centrifugal.Centrifuge
 
             foreach (var sub in _subscriptions.Values)
             {
-                await sub.SetUnsubscribedAsync(CentrifugeUnsubscribedCodes.ClientClosed, "client closed", sendUnsubscribe: false).ConfigureAwait(false);
-                sub.Dispose();
+                sub.Close(CentrifugeUnsubscribedCodes.ClientClosed, "client closed", sendUnsubscribe: false);
             }
-            _subscriptions.Clear();
         }
     }
 }

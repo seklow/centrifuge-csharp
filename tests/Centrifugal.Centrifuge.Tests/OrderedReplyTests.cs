@@ -880,6 +880,184 @@ namespace Centrifugal.Centrifuge.Tests
             Assert.Equal(200UL, last.Offset);
         }
 
+        /// <summary>
+        /// An Unsubscribed handler of a disposed subscription can subscribe its channel anew (as
+        /// centrifuge-js): the disposed one leaves the client before its events, and the server gets
+        /// its unsubscribe before the new subscribe, which the handler waits to reach the server.
+        /// </summary>
+        [Fact]
+        public async Task DisposedSubscriptionHandlerSubscribesChannelAnew()
+        {
+            var client = NewClient();
+            client.Connect();
+            await client.ReadyAsync(Wait);
+
+            var sub = client.NewSubscription("renew");
+            sub.Subscribe();
+            await sub.ReadyAsync(Wait);
+            CentrifugeSubscription? renewed = null;
+            sub.Unsubscribed += (_, _) =>
+            {
+                renewed = client.NewSubscription("renew");
+                renewed.Subscribe();
+                SpinWait.SpinUntil(() => _server.Received.Count(c => c.Subscribe != null) == 2, Wait);
+            };
+
+            sub.Dispose();
+
+            Assert.NotNull(renewed);
+            Assert.Same(renewed, client.GetSubscription("renew"));
+            await renewed!.ReadyAsync(Wait);
+            var wire = _server.Received
+                .Where(c => c.Subscribe != null || c.Unsubscribe != null)
+                .Select(c => c.Subscribe != null ? "sub" : "unsub");
+            Assert.Equal(new[] { "sub", "unsub", "sub" }, wire);
+        }
+
+        /// <summary>
+        /// Disposing the client removes each subscription before its Unsubscribed(ClientClosed) events
+        /// and leaves the registry empty.
+        /// </summary>
+        [Fact]
+        public async Task DisposedClientRemovesSubscriptionsBeforeTheirEvents()
+        {
+            var client = NewClient();
+            client.Connect();
+            await client.ReadyAsync(Wait);
+            var sub = client.NewSubscription("closing");
+            sub.Subscribe();
+            await sub.ReadyAsync(Wait);
+            var registered = true;
+            int? code = null;
+            sub.Unsubscribed += (_, e) =>
+            {
+                registered = client.GetSubscription("closing") != null;
+                code = e.Code;
+            };
+
+            await client.DisposeAsync();
+
+            Assert.False(registered);
+            Assert.Equal(CentrifugeUnsubscribedCodes.ClientClosed, code);
+            Assert.Empty(client.Subscriptions);
+        }
+
+        /// <summary>
+        /// Disposing the client while a subscription's own Dispose is in progress: when DisposeAsync
+        /// completes, the subscription is Unsubscribed and its ReadyAsync rejected. The competing Dispose
+        /// waits for the subscription lock this thread holds; the never-connected client disposes
+        /// synchronously, its close takes the lock reentrantly, makes the transition with its code, and the
+        /// later close adds no events.
+        /// </summary>
+        [Fact]
+        public async Task ClientDisposalUnsubscribesSubscriptionBeingDisposed()
+        {
+            var client = NewClient();
+            var sub = client.NewSubscription("racing");
+            var codes = new List<int>();
+            sub.Unsubscribed += (_, e) => codes.Add(e.Code);
+            sub.Subscribe();
+            var ready = sub.ReadyAsync();
+
+            Task subDisposal;
+            ValueTask clientDisposal;
+            lock (Field(sub, "_stateChangeLock")!)
+            {
+                subDisposal = Task.Run(sub.Dispose);
+                Assert.True(SpinWait.SpinUntil(() => (int)Field(sub, "_disposed")! == 1, Wait));
+
+                clientDisposal = client.DisposeAsync();
+                Assert.True(clientDisposal.IsCompleted);
+                Assert.Equal(CentrifugeSubscriptionState.Unsubscribed, sub.State);
+                Assert.True(ready.IsFaulted);
+            }
+
+            await clientDisposal;
+            await subDisposal.WaitAsync(Wait);
+            Assert.Equal(new[] { CentrifugeUnsubscribedCodes.ClientClosed }, codes);
+        }
+
+        /// <summary>
+        /// RemoveSubscription removes only the instance this client holds: another client's subscription of
+        /// the channel stays registered and usable (the ownership check); removing a stale instance leaves
+        /// the newer one of its channel (removal by instance).
+        /// </summary>
+        [Fact]
+        public void RemoveSubscriptionLeavesInstancesNotHeld()
+        {
+            var client = NewClient();
+            using var other = new CentrifugeClient(_server.Url);
+            var foreign = other.NewSubscription("shared");
+            var stale = client.NewSubscription("shared");
+            stale.Dispose();
+            var renewed = client.NewSubscription("shared");
+
+            client.RemoveSubscription(foreign);
+            client.RemoveSubscription(stale);
+
+            Assert.Same(foreign, other.GetSubscription("shared"));
+            Assert.Same(renewed, client.GetSubscription("shared"));
+            foreign.Subscribe();
+            renewed.Subscribe();
+        }
+
+        /// <summary>Disposing a Subscribed subscription with an expiring token drops its refresh timer.</summary>
+        [Fact]
+        public async Task DisposedSubscriptionDropsRefreshTimer()
+        {
+            _server.OnSubscribe = (_, _) => new SubscribeResult { Expires = true, Ttl = 60 };
+            var client = NewClient();
+            client.Connect();
+            await client.ReadyAsync(Wait);
+            var sub = client.NewSubscription("expiring", new CentrifugeSubscriptionOptions
+            {
+                Token = "t",
+                GetToken = _ => Task.FromResult("t"),
+            });
+            sub.Subscribe();
+            await sub.ReadyAsync(Wait);
+            Assert.NotNull(Field(sub, "_refreshTimer"));
+
+            sub.Dispose();
+
+            Assert.Null(Field(sub, "_refreshTimer"));
+        }
+
+        /// <summary>A handler of a disposed subscription may dispose the client synchronously: the close
+        /// doesn't await the unsubscribe reply.</summary>
+        [Fact]
+        public async Task DisposedSubscriptionHandlerDisposesClient()
+        {
+            var client = NewClient();
+            client.Connect();
+            await client.ReadyAsync(Wait);
+            var sub = client.NewSubscription("closing");
+            sub.Subscribe();
+            await sub.ReadyAsync(Wait);
+            sub.Unsubscribed += (_, _) => client.Dispose();
+
+            await Task.Run(sub.Dispose).WaitAsync(Wait);
+
+            Assert.Equal(CentrifugeClientState.Disconnected, client.State);
+        }
+
+        /// <summary>A ReadyAsync timeout is a temporary CentrifugeTimeoutException, as a reply timeout.</summary>
+        [Fact]
+        public async Task ReadyTimeoutIsTemporaryTimeoutException()
+        {
+            var held = HoldFirstSubscribe();
+            var client = NewClient();
+            client.Connect();
+            await client.ReadyAsync(Wait);
+            var sub = client.NewSubscription("slow");
+            sub.Subscribe();
+            await held.Task.WaitAsync(Wait);
+
+            var ex = await Assert.ThrowsAsync<CentrifugeTimeoutException>(() => sub.ReadyAsync(TimeSpan.FromMilliseconds(50)));
+
+            Assert.True(ex.Temporary);
+        }
+
         [Fact]
         public async Task SupersededGetTokenFailureHandsOverWithoutBackoff()
         {
@@ -1553,9 +1731,7 @@ namespace Centrifugal.Centrifuge.Tests
             client.Connect();
             await client.ReadyAsync(Wait);
 
-            var flushLock = (SemaphoreSlim)typeof(CentrifugeClient)
-                .GetField("_flushLock", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance)!
-                .GetValue(client)!;
+            var flushLock = (SemaphoreSlim)Field(client, "_flushLock")!;
             await flushLock.WaitAsync();
 
             _server.CloseConnection();
@@ -2277,10 +2453,8 @@ namespace Centrifugal.Centrifuge.Tests
         /// <summary>Holds the flush of the client's session; returns its lock and the command queue.</summary>
         private static async Task<(SemaphoreSlim FlushLock, System.Collections.ICollection Batch)> HoldFlushAsync(CentrifugeClient client)
         {
-            var flushLock = (SemaphoreSlim)typeof(CentrifugeClient)
-                .GetField("_flushLock", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(client)!;
-            var batch = (System.Collections.ICollection)typeof(CentrifugeClient)
-                .GetField("_commandBatch", BindingFlags.NonPublic | BindingFlags.Instance)!.GetValue(client)!;
+            var flushLock = (SemaphoreSlim)Field(client, "_flushLock")!;
+            var batch = (System.Collections.ICollection)Field(client, "_commandBatch")!;
             await flushLock.WaitAsync();
             return (flushLock, batch);
         }
@@ -2745,14 +2919,13 @@ namespace Centrifugal.Centrifuge.Tests
             client.Disconnected += (_, _) => Interlocked.Increment(ref disconnected);
             client.Connect();
             await client.ReadyAsync(Wait);
-            const System.Reflection.BindingFlags flags = System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance;
-            var epoch = (int)typeof(CentrifugeClient).GetField("_epoch", flags)!.GetValue(client)!;
+            var epoch = (int)Field(client, "_epoch")!;
             NoPing.Fire(client);
             await client.ReadyAsync(Wait);
 
             if (outcome == "reply")
             {
-                typeof(CentrifugeClient).GetMethod("HandleRefreshReply", flags)!
+                typeof(CentrifugeClient).GetMethod("HandleRefreshReply", Private)!
                     .Invoke(client, new object[] { new RefreshResult { Client = "c", Expires = true, Ttl = 1 }, epoch });
             }
             else
@@ -2760,7 +2933,7 @@ namespace Centrifugal.Centrifuge.Tests
                 var error = outcome == "temporary"
                     ? new CentrifugeException(100, "internal", true)
                     : new CentrifugeException(103, "permission denied", false);
-                typeof(CentrifugeClient).GetMethod("HandleRefreshError", flags)!
+                typeof(CentrifugeClient).GetMethod("HandleRefreshError", Private)!
                     .Invoke(client, new object[] { error, epoch });
             }
 

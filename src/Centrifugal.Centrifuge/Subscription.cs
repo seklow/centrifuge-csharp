@@ -180,14 +180,18 @@ namespace Centrifugal.Centrifuge
             _ = Task.Run(SendSubscribeIfNeededAsync);
         }
 
+        private bool IsDisposed => Volatile.Read(ref _disposed) != 0;
+
         private void ThrowIfDisposed()
         {
-            if (System.Threading.Interlocked.CompareExchange(ref _disposed, 0, 0) != 0)
+            if (IsDisposed)
                 throw new ObjectDisposedException(nameof(CentrifugeSubscription));
         }
 
         /// <summary>
-        /// Unsubscribes from the channel. This method returns immediately and starts the unsubscription process in the background.
+        /// Unsubscribes from the channel: the transition and its StateChanged/Unsubscribed handlers run on the
+        /// calling thread; the unsubscribe reply isn't awaited — an error reply or its timeout reconnects the
+        /// client's session (Connecting with UnsubscribeError).
         /// </summary>
         public void Unsubscribe()
         {
@@ -201,7 +205,8 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         /// <param name="timeout">Optional timeout.</param>
         /// <param name="cancellationToken">Optional cancellation token.</param>
-        /// <returns>A task that completes when subscribed.</returns>
+        /// <returns>A task that completes when subscribed; after <paramref name="timeout"/> it fails with
+        /// <see cref="CentrifugeTimeoutException"/>.</returns>
         /// <exception cref="ArgumentOutOfRangeException">The timeout is negative (other than infinite) or too large for a timer.</exception>
         public Task ReadyAsync(TimeSpan? timeout = null, CancellationToken cancellationToken = default)
         {
@@ -904,7 +909,7 @@ namespace Centrifugal.Centrifuge
         /// </summary>
         internal bool HandleSubscribeReply(SubscribeResult result, int epoch, long connectionGeneration, long attempt)
         {
-            if (System.Threading.Interlocked.CompareExchange(ref _disposed, 0, 0) != 0) return true;
+            if (IsDisposed) return true;
 
             bool recovered = result.Recovered;
             CentrifugeStreamPosition? streamPositionSnapshot;
@@ -1144,8 +1149,9 @@ namespace Centrifugal.Centrifuge
         /// <paramref name="connectionGeneration"/>; a superseded one hands over at once. The check and
         /// the arming are one critical section: a teardown after them cancels the wait (MoveToSubscribing),
         /// so a stale backoff never holds off the next session. Returns false when the wait was cancelled
-        /// (a newer one replaced it, or the subscription moved on) or the subscription left Subscribing.
-        /// A wait that ran out is released, so the next attempt can run.
+        /// (a newer one replaced it, or the subscription moved on), the subscription left Subscribing or is
+        /// disposed (Close marks it before its transition). A wait that ran out is released, so the next
+        /// attempt can run.
         /// </summary>
         private async Task<bool> DelayResubscribeAsync(int epoch, long connectionGeneration)
         {
@@ -1155,8 +1161,7 @@ namespace Centrifugal.Centrifuge
             {
                 if (_state != CentrifugeSubscriptionState.Subscribing) return false;
                 if (!IsCurrentAttempt(epoch, connectionGeneration)) return true;
-                // Don't recreate _resubscribeCts after Dispose has nulled it — that would leak the CTS.
-                if (System.Threading.Interlocked.CompareExchange(ref _disposed, 0, 0) != 0) return false;
+                if (IsDisposed) return false;
 
                 var oldCts = _resubscribeCts;
                 _resubscribeCts = new CancellationTokenSource();
@@ -1272,6 +1277,7 @@ namespace Centrifugal.Centrifuge
                 }
             }
 
+            if (IsDisposed) _client.Unregister(this);
             Raise(StateChanged, new CentrifugeSubscriptionStateEventArgs(prevState, CentrifugeSubscriptionState.Unsubscribed), "stateChanged");
             if (IsEpoch(unsubscribedEpoch))
                 Raise(Unsubscribed, new CentrifugeUnsubscribedEventArgs(code, reason), "unsubscribed");
@@ -1335,13 +1341,13 @@ namespace Centrifugal.Centrifuge
         /// <summary>
         /// Replaces the refresh timer of the Subscribed state <paramref name="epoch"/> and connection
         /// session <paramref name="generation"/>: a callback of a state or session that ended does
-        /// nothing. Call under _stateChangeLock: Dispose takes the timer under it after marking the
-        /// subscription disposed, so a disposed subscription arms none.
+        /// nothing. Call under _stateChangeLock: a disposed subscription arms none, and leaving Subscribed
+        /// clears the timer (SetState).
         /// </summary>
         private void ArmRefreshTimer(int delay, int epoch, long generation)
         {
             ClearRefreshTimer();
-            if (Interlocked.CompareExchange(ref _disposed, 0, 0) != 0) return;
+            if (IsDisposed) return;
             _refreshTimer = new Timer(_ => _ = RefreshTokenAsync(epoch, generation), null, delay, Timeout.Infinite);
         }
 
@@ -1475,28 +1481,36 @@ namespace Centrifugal.Centrifuge
 
         /// <summary>
         /// Unsubscribes (as Unsubscribe()), removes the subscription from its client and releases its
-        /// timers; a disposed subscription can't subscribe again.
+        /// timers; a disposed subscription can't subscribe again. The removal comes after the unsubscribe
+        /// is queued (when the server may hold the subscription and the client is connected) and before
+        /// the StateChanged/Unsubscribed events, which the call making the transition raises on its thread
+        /// (one already Unsubscribed raises none): their handler may subscribe the channel anew (as
+        /// centrifuge-js).
         /// </summary>
-        public void Dispose()
-        {
-            if (System.Threading.Interlocked.CompareExchange(ref _disposed, 1, 0) != 0) return;
+        public void Dispose() =>
+            Close(CentrifugeUnsubscribedCodes.UnsubscribeCalled, "unsubscribe called", sendUnsubscribe: true);
 
-            _ = SetUnsubscribedAsync(CentrifugeUnsubscribedCodes.UnsubscribeCalled, "unsubscribe called", sendUnsubscribe: true);
+        /// <summary>
+        /// Disposes with the given unsubscribe (the client's disposal passes ClientClosed), as Dispose().
+        /// Every call runs the whole close, each step idempotent; the transition and its handlers run
+        /// synchronously, the unsubscribe reply isn't awaited: on return the subscription is Unsubscribed
+        /// and removed, with the code of whichever call made the transition.
+        /// </summary>
+        internal void Close(int code, string reason, bool sendUnsubscribe)
+        {
+            Interlocked.Exchange(ref _disposed, 1);
+            _ = SetUnsubscribedAsync(code, reason, sendUnsubscribe);
             _client.Unregister(this);
 
             CancellationTokenSource? cts;
-            Timer? timer;
             lock (_stateChangeLock)
             {
                 cts = _resubscribeCts;
                 _resubscribeCts = null;
-                timer = _refreshTimer;
-                _refreshTimer = null;
             }
 
-            try { cts?.Cancel(); } catch (ObjectDisposedException) { }
+            cts?.Cancel();
             cts?.Dispose();
-            timer?.Dispose();
         }
     }
 }
